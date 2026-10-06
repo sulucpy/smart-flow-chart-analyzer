@@ -1,5 +1,0 @@
-streamlit>=1.40
-pandas>=2.2
-numpy>=1.26
-requests>=2.32
-websocket-client>=1.8
