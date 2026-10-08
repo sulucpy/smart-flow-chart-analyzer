@@ -1,0 +1,1288 @@
+
+import json
+import threading
+import time
+from collections import deque
+from datetime import datetime, timezone, timedelta
+
+import numpy as np
+import pandas as pd
+import requests
+import streamlit as st
+import websocket
+
+# ============================================================
+# Smart Flow Gold — Live XAUUSD + Big Candle + Telegram Alerts
+# ============================================================
+# IMPORTANT:
+# - Put secrets in Streamlit -> Manage app -> Settings -> Secrets.
+# - Never put Telegram token or SiftingIO key in GitHub code.
+#
+# Required secrets:
+# SIFTINGIO_API_KEY = "..."
+# TELEGRAM_BOT_TOKEN = "..."
+# TELEGRAM_CHAT_ID = "..."
+#
+# The app uses SiftingIO's live XAUUSD WebSocket to build the
+# current 5-minute candle locally, so a stale REST 5M bar does
+# not block the early-entry engine.
+# ============================================================
+
+st.set_page_config(
+    page_title="Smart Flow Gold Alerts",
+    page_icon="🟡",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+BASE = "https://api.sifting.io"
+WS_URL = "wss://stream.sifting.io/ws/v1"
+SYMBOL = "XAUUSD"
+
+
+# -----------------------------
+# Secrets / configuration
+# -----------------------------
+def get_secret(name: str, default: str = "") -> str:
+    try:
+        value = st.secrets.get(name, default)
+        return str(value) if value is not None else default
+    except Exception:
+        return default
+
+
+SIFTING_KEY = get_secret("SIFTINGIO_API_KEY")
+TELEGRAM_TOKEN = get_secret("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = get_secret("TELEGRAM_CHAT_ID")
+
+
+# -----------------------------
+# Live WebSocket feed
+# -----------------------------
+class GoldFeed:
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.lock = threading.Lock()
+        self.ticks = deque(maxlen=6000)
+        self.completed = deque(maxlen=300)
+        self.current = None
+        self.last_tick = None
+        self.last_error = ""
+        self.connected = False
+        self.stop_event = threading.Event()
+        self.thread = None
+
+    @staticmethod
+    def bucket(ts_ms: int) -> int:
+        return (ts_ms // 300_000) * 300_000
+
+    def _update_candle(self, price: float, ts_ms: int):
+        bucket = self.bucket(ts_ms)
+        with self.lock:
+            if self.current is None or bucket != self.current["t"]:
+                if self.current is not None:
+                    self.completed.append(dict(self.current))
+                self.current = {
+                    "t": bucket,
+                    "o": price,
+                    "h": price,
+                    "l": price,
+                    "c": price,
+                    "v": 1,
+                }
+            else:
+                self.current["h"] = max(self.current["h"], price)
+                self.current["l"] = min(self.current["l"], price)
+                self.current["c"] = price
+                self.current["v"] += 1
+
+            self.last_tick = {
+                "price": price,
+                "t": ts_ms,
+                "received": time.time(),
+            }
+
+    def _handle(self, raw):
+        try:
+            msg = json.loads(raw)
+        except Exception:
+            return
+
+        if msg.get("f") == "tick" and msg.get("s") == SYMBOL:
+            try:
+                price = float(msg["p"])
+                ts_ms = int(msg["t"])
+                self.ticks.append((ts_ms, price))
+                self._update_candle(price, ts_ms)
+            except Exception:
+                pass
+
+        elif msg.get("f") == "error":
+            with self.lock:
+                self.last_error = f'{msg.get("code", "error")}: {msg.get("message", "")}'
+
+    def _run(self):
+        while not self.stop_event.is_set():
+            ws = None
+            ping_stop = threading.Event()
+            try:
+                ws = websocket.create_connection(
+                    f"{WS_URL}?key={self.api_key}",
+                    timeout=20,
+                    enable_multithread=True,
+                )
+                ws.settimeout(5)
+                ws.send(json.dumps({
+                    "op": "subscribe",
+                    "product": "com",
+                    "symbols": [SYMBOL],
+                }))
+                with self.lock:
+                    self.connected = True
+                    self.last_error = ""
+
+                def pinger():
+                    while not ping_stop.wait(30):
+                        try:
+                            ws.send(json.dumps({"op": "ping"}))
+                        except Exception:
+                            break
+
+                threading.Thread(target=pinger, daemon=True).start()
+
+                while not self.stop_event.is_set():
+                    try:
+                        raw = ws.recv()
+                        if raw:
+                            self._handle(raw)
+                    except websocket.WebSocketTimeoutException:
+                        continue
+                    except Exception:
+                        break
+
+            except Exception as e:
+                with self.lock:
+                    self.last_error = str(e)[:240]
+            finally:
+                ping_stop.set()
+                try:
+                    if ws:
+                        ws.close()
+                except Exception:
+                    pass
+                with self.lock:
+                    self.connected = False
+
+            self.stop_event.wait(2)
+
+    def start(self):
+        if self.thread and self.thread.is_alive():
+            return
+        self.stop_event.clear()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def snapshot(self):
+        with self.lock:
+            return {
+                "connected": self.connected,
+                "current": dict(self.current) if self.current else None,
+                "completed": list(self.completed),
+                "last_tick": dict(self.last_tick) if self.last_tick else None,
+                "error": self.last_error,
+            }
+
+
+@st.cache_resource(show_spinner=False)
+def get_feed(api_key: str):
+    feed = GoldFeed(api_key)
+    feed.start()
+    return feed
+
+
+@st.cache_resource(show_spinner=False)
+def get_alert_state():
+    return {"last_key": "", "last_sent": 0.0, "last_result": ""}
+
+
+# -----------------------------
+# REST historical data
+# -----------------------------
+@st.cache_data(ttl=60, show_spinner=False)
+def get_bars(api_key: str, interval: str, limit: int = 250) -> pd.DataFrame:
+    if not api_key:
+        return pd.DataFrame()
+
+    url = f"{BASE}/v1/hist/commodities/{SYMBOL}/bars"
+    # First request needs a start. SiftingIO's first page is ordered from
+    # the requested start, so choose a recent window that is just large
+    # enough to include the latest bars we need for the indicators.
+    # This avoids accidentally loading an old first page (which previously
+    # made the 1H/15M/5M REST data appear weeks behind the live WebSocket).
+    span_days = {
+        "1h": 14,
+        "15m": 4,
+        "5m": 2,
+    }.get(interval, 4)
+    now = datetime.now(timezone.utc)
+    start = (now - timedelta(days=span_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    params = {
+        "start": start,
+        "end": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "interval": interval,
+        "limit": min(max(int(limit), 320), 2000),
+    }
+    headers = {
+        "X-API-Key": api_key,
+        "Accept-Encoding": "gzip",
+    }
+    r = requests.get(url, params=params, headers=headers, timeout=8)
+    r.raise_for_status()
+    body = r.json()
+    rows = body.get("data", body if isinstance(body, list) else [])
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+    rename = {"t": "time", "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"}
+    df = df.rename(columns=rename)
+    for col in ["open", "high", "low", "close"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
+    df = df.dropna(subset=["time", "open", "high", "low", "close"]).sort_values("time").drop_duplicates("time")
+    return df.tail(limit).reset_index(drop=True)
+
+
+# -----------------------------
+# Live REST quote fallback
+# -----------------------------
+@st.cache_data(ttl=5, show_spinner=False)
+def get_live_quote(api_key: str):
+    """Get the latest SiftingIO XAUUSD quote when WebSocket is reconnecting.
+
+    This is a price fallback only. It must NOT be used to build the current
+    5M candle or trigger live signals because it is a snapshot, not a tick stream.
+    """
+    if not api_key:
+        return None
+    url = f"{BASE}/v1/last/quote/commodities/{SYMBOL}"
+    try:
+        r = requests.get(
+            url,
+            headers={"X-API-Key": api_key, "Accept-Encoding": "gzip"},
+            timeout=4,
+        )
+        r.raise_for_status()
+        body = r.json()
+        row = body.get("data", body) if isinstance(body, dict) else body
+        if isinstance(row, list):
+            row = row[0] if row else {}
+        bid = float(row.get("b")) if row.get("b") is not None else None
+        ask = float(row.get("a")) if row.get("a") is not None else None
+        last = row.get("p")
+        if last is not None:
+            last = float(last)
+        elif bid is not None and ask is not None:
+            last = (bid + ask) / 2.0
+        elif bid is not None:
+            last = bid
+        elif ask is not None:
+            last = ask
+        if last is None:
+            return None
+        ts = row.get("t")
+        if ts is not None:
+            try:
+                ts = int(ts)
+                if ts < 10_000_000_000:
+                    ts *= 1000
+            except Exception:
+                ts = None
+        return {"price": last, "bid": bid, "ask": ask, "t": ts, "received": time.time()}
+    except Exception:
+        return None
+
+
+# -----------------------------
+# Indicators
+# -----------------------------
+def ema(s, n):
+    return s.ewm(span=n, adjust=False).mean()
+
+
+def rsi(s, n=14):
+    d = s.diff()
+    up = d.clip(lower=0)
+    dn = -d.clip(upper=0)
+    au = up.ewm(alpha=1 / n, adjust=False).mean()
+    ad = dn.ewm(alpha=1 / n, adjust=False).mean()
+    rs = au / ad.replace(0, np.nan)
+    out = 100 - (100 / (1 + rs))
+    return out.fillna(50)
+
+
+def atr(df, n=14):
+    prev = df["close"].shift(1)
+    tr = pd.concat([
+        df["high"] - df["low"],
+        (df["high"] - prev).abs(),
+        (df["low"] - prev).abs(),
+    ], axis=1).max(axis=1)
+    return tr.ewm(alpha=1 / n, adjust=False).mean()
+
+
+def adx_di(df, n=14):
+    h, l, c = df["high"], df["low"], df["close"]
+    up = h.diff()
+    down = -l.diff()
+    plus_dm = pd.Series(np.where((up > down) & (up > 0), up, 0.0), index=df.index)
+    minus_dm = pd.Series(np.where((down > up) & (down > 0), down, 0.0), index=df.index)
+    tr = pd.concat([
+        h - l,
+        (h - c.shift()).abs(),
+        (l - c.shift()).abs(),
+    ], axis=1).max(axis=1)
+    atrv = tr.ewm(alpha=1 / n, adjust=False).mean().replace(0, np.nan)
+    pdi = 100 * plus_dm.ewm(alpha=1 / n, adjust=False).mean() / atrv
+    mdi = 100 * minus_dm.ewm(alpha=1 / n, adjust=False).mean() / atrv
+    dx = 100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)
+    adx = dx.ewm(alpha=1 / n, adjust=False).mean()
+    return adx.fillna(0), pdi.fillna(0), mdi.fillna(0)
+
+
+def enrich(df):
+    if df.empty:
+        return df
+    x = df.copy()
+    x["ema20"] = ema(x.close, 20)
+    x["ema50"] = ema(x.close, 50)
+    x["ema200"] = ema(x.close, 200)
+    x["rsi"] = rsi(x.close, 14)
+    x["atr"] = atr(x, 14)
+    x["adx"], x["pdi"], x["mdi"] = adx_di(x, 14)
+    # Session VWAP approximation from available bars.
+    day = x["time"].dt.date
+    tp = (x.high + x.low + x.close) / 3
+    x["vwap"] = (tp * x.get("volume", pd.Series(1, index=x.index)).fillna(1)).groupby(day).cumsum() / (
+        x.get("volume", pd.Series(1, index=x.index)).fillna(1).groupby(day).cumsum()
+    )
+    return x
+
+
+def trend_state(row):
+    if row.empty:
+        return "NEUTRAL"
+    if row.ema20.iloc[-1] > row.ema50.iloc[-1] > row.ema200.iloc[-1] and row.close.iloc[-1] > row.ema20.iloc[-1]:
+        return "BULL"
+    if row.ema20.iloc[-1] < row.ema50.iloc[-1] < row.ema200.iloc[-1] and row.close.iloc[-1] < row.ema20.iloc[-1]:
+        return "BEAR"
+    return "NEUTRAL"
+
+
+def structure(df):
+    if len(df) < 25:
+        return {"sweep": False, "choch": False, "bos_bull": False, "bos_bear": False}
+    x = df
+    last = x.iloc[-1]
+    prev_hi = x.high.iloc[-11:-1].max()
+    prev_lo = x.low.iloc[-11:-1].min()
+    prior_hi = x.high.iloc[-21:-11].max()
+    prior_lo = x.low.iloc[-21:-11].min()
+
+    bos_bull = bool(last.close > prev_hi)
+    bos_bear = bool(last.close < prev_lo)
+
+    sweep_low = bool(last.low < prev_lo and last.close > prev_lo)
+    sweep_high = bool(last.high > prev_hi and last.close < prev_hi)
+
+    choch = bool(
+        (last.close > prior_hi and last.close > prev_hi) or
+        (last.close < prior_lo and last.close < prev_lo)
+    )
+    return {
+        "sweep": sweep_low or sweep_high,
+        "choch": choch,
+        "bos_bull": bos_bull,
+        "bos_bear": bos_bear,
+        "sweep_low": sweep_low,
+        "sweep_high": sweep_high,
+    }
+
+
+def support_resistance(df, max_levels=4):
+    if len(df) < 30:
+        return {"support": [], "resistance": []}
+    x = df.copy()
+    a = float(x["atr"].iloc[-1]) if "atr" in x and pd.notna(x["atr"].iloc[-1]) else float(x["close"].iloc[-1]) * 0.002
+    tol = max(a * 0.55, 0.8)
+    highs, lows = [], []
+    for i in range(3, len(x) - 3):
+        if x.high.iloc[i] == x.high.iloc[i-3:i+4].max():
+            highs.append(float(x.high.iloc[i]))
+        if x.low.iloc[i] == x.low.iloc[i-3:i+4].min():
+            lows.append(float(x.low.iloc[i]))
+
+    def cluster(vals):
+        out = []
+        for v in sorted(vals):
+            if not out or abs(v - out[-1]) > tol:
+                out.append(v)
+            else:
+                out[-1] = (out[-1] + v) / 2
+        return out
+
+    price = float(x.close.iloc[-1])
+    sup = [v for v in cluster(lows) if v <= price]
+    res = [v for v in cluster(highs) if v >= price]
+    return {"support": sup[-max_levels:], "resistance": res[:max_levels]}
+
+
+def nearest(levels, price, direction):
+    arr = levels.get(direction, [])
+    if not arr:
+        return None
+    if direction == "support":
+        return max([x for x in arr if x <= price], default=None)
+    return min([x for x in arr if x >= price], default=None)
+
+
+# -----------------------------
+# Live 5M engine
+# -----------------------------
+def make_live_df(snap):
+    rows = list(snap.get("completed", []))
+    cur = snap.get("current")
+    if cur:
+        rows.append(cur)
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    df["time"] = pd.to_datetime(df["t"], unit="ms", utc=True)
+    return df[["time", "o", "h", "l", "c", "v"]].rename(
+        columns={"o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"}
+    )
+
+
+def early_engine(live5, h1, m15, price):
+    if live5.empty or len(live5) < 15:
+        return {
+            "status": "WAIT", "direction": "NEUTRAL", "score": 0,
+            "quality": "C", "up_trigger": price, "down_trigger": price,
+            "reason": "Waiting for live 5M candles.",
+        }
+
+    x = enrich(live5)
+    cur = x.iloc[-1]
+    atrv = float(x.atr.iloc[-1]) if pd.notna(x.atr.iloc[-1]) else max(price * 0.001, 1)
+    prior = x.iloc[-2]
+    micro_hi = float(x.high.iloc[-6:-1].max())
+    micro_lo = float(x.low.iloc[-6:-1].min())
+
+    body = abs(float(cur.close - cur.open))
+    rng = max(float(cur.high - cur.low), 1e-9)
+    body_ratio = body / rng
+    speed = 0.0
+    if len(live5) >= 3:
+        dt = max((live5.time.iloc[-1] - live5.time.iloc[-3]).total_seconds(), 1)
+        speed = float((live5.close.iloc[-1] - live5.close.iloc[-3]) / dt)
+
+    atr_ratio = rng / max(atrv, 1e-9)
+    h1e = enrich(h1) if not h1.empty else h1
+    m15e = enrich(m15) if not m15.empty else m15
+    h1trend = trend_state(h1e)
+    m15trend = trend_state(m15e)
+
+    bull = 0
+    bear = 0
+    bull_reasons, bear_reasons = [], []
+
+    if h1trend == "BULL":
+        bull += 20; bull_reasons.append("1H bullish")
+    elif h1trend == "BEAR":
+        bear += 20; bear_reasons.append("1H bearish")
+
+    if m15trend == "BULL":
+        bull += 15; bull_reasons.append("15M bullish")
+    elif m15trend == "BEAR":
+        bear += 15; bear_reasons.append("15M bearish")
+
+    if cur.close > cur.ema20:
+        bull += 10; bull_reasons.append("5M above EMA20")
+    else:
+        bear += 10; bear_reasons.append("5M below EMA20")
+
+    if cur.pdi > cur.mdi:
+        bull += 10; bull_reasons.append("+DI pressure")
+    else:
+        bear += 10; bear_reasons.append("-DI pressure")
+
+    if cur.rsi >= 52:
+        bull += 8; bull_reasons.append("RSI pressure")
+    elif cur.rsi <= 48:
+        bear += 8; bear_reasons.append("RSI pressure")
+
+    if body_ratio >= 0.60:
+        if cur.close > cur.open:
+            bull += 12; bull_reasons.append("strong bullish body")
+        else:
+            bear += 12; bear_reasons.append("strong bearish body")
+
+    if atr_ratio >= 0.65:
+        if cur.close > cur.open:
+            bull += 10; bull_reasons.append("range expansion UP")
+        else:
+            bear += 10; bear_reasons.append("range expansion DOWN")
+
+    if cur.close > micro_hi:
+        bull += 15; bull_reasons.append("micro-high breakout")
+    if cur.close < micro_lo:
+        bear += 15; bear_reasons.append("micro-low breakout")
+
+    up_trigger = micro_hi + max(atrv * 0.03, 0.05)
+    down_trigger = micro_lo - max(atrv * 0.03, 0.05)
+
+    sr = support_resistance(x)
+    sup = nearest(sr, price, "support")
+    res = nearest(sr, price, "resistance")
+
+    if sup is not None and abs(price - sup) <= atrv * 0.30:
+        bull += 8; bull_reasons.append("near support")
+    if res is not None and abs(price - res) <= atrv * 0.30:
+        bear += 8; bear_reasons.append("near resistance")
+
+    best = max(bull, bear)
+    direction = "UP" if bull > bear else "DOWN" if bear > bull else "NEUTRAL"
+    score = int(min(100, best))
+
+    # Anti-chase: a large move already far from its trigger is not a new entry.
+    extension = abs(price - (micro_hi if direction == "UP" else micro_lo if direction == "DOWN" else price))
+    chase = extension > atrv * 0.90 and atr_ratio > 1.15
+
+    if direction == "UP" and bull >= 70 and not chase:
+        status = "BIG CANDLE BUY NOW" if cur.close > micro_hi else "READY UP"
+    elif direction == "DOWN" and bear >= 70 and not chase:
+        status = "BIG CANDLE SELL NOW" if cur.close < micro_lo else "READY DOWN"
+    elif direction == "UP" and bull >= 55:
+        status = "BUILDING UP"
+    elif direction == "DOWN" and bear >= 55:
+        status = "BUILDING DOWN"
+    else:
+        status = "WAIT"
+
+    if chase:
+        status = "EXTENDED — DON'T CHASE"
+
+    quality = "A+" if score >= 85 else "A" if score >= 70 else "B" if score >= 55 else "C"
+
+    return {
+        "status": status,
+        "direction": direction,
+        "score": score,
+        "quality": quality,
+        "up_trigger": up_trigger,
+        "down_trigger": down_trigger,
+        "body_ratio": body_ratio,
+        "atr_ratio": atr_ratio,
+        "speed": speed,
+        "micro_hi": micro_hi,
+        "micro_lo": micro_lo,
+        "h1trend": h1trend,
+        "m15trend": m15trend,
+        "support": sup,
+        "resistance": res,
+        "reasons": bull_reasons if direction == "UP" else bear_reasons,
+        "atr": atrv,
+    }
+
+
+# -----------------------------
+# Smart Flow signal
+# -----------------------------
+def smart_flow_signal(h1, m15, m5, live_engine):
+    if h1.empty or m15.empty or m5.empty:
+        return {"signal": "WAIT", "score": 0, "reason": "Insufficient market data."}
+
+    H, M, X = enrich(h1), enrich(m15), enrich(m5)
+    ht, mt, xt = trend_state(H), trend_state(M), trend_state(X)
+    stc = structure(X)
+    sr = support_resistance(X)
+    price = float(X.close.iloc[-1])
+
+    score_b = 0
+    score_s = 0
+    br, sr_reasons = [], []
+
+    if ht == "BULL": score_b += 25; br.append("1H BULL")
+    if ht == "BEAR": score_s += 25; sr_reasons.append("1H BEAR")
+    if mt == "BULL": score_b += 20; br.append("15M BULL")
+    if mt == "BEAR": score_s += 20; sr_reasons.append("15M BEAR")
+    if xt == "BULL": score_b += 10; br.append("5M BULL")
+    if xt == "BEAR": score_s += 10; sr_reasons.append("5M BEAR")
+
+    if stc["sweep_low"]: score_b += 12; br.append("liquidity sweep low")
+    if stc["sweep_high"]: score_s += 12; sr_reasons.append("liquidity sweep high")
+    if stc["bos_bull"]: score_b += 18; br.append("BOS UP")
+    if stc["bos_bear"]: score_s += 18; sr_reasons.append("BOS DOWN")
+
+    last = X.iloc[-1]
+    if last.rsi > 52: score_b += 5
+    if last.rsi < 48: score_s += 5
+
+    ns = nearest(sr, price, "support")
+    nr = nearest(sr, price, "resistance")
+    if ns is not None and abs(price - ns) <= last.atr * 0.35:
+        score_b += 8; br.append("near support")
+    if nr is not None and abs(price - nr) <= last.atr * 0.35:
+        score_s += 8; sr_reasons.append("near resistance")
+
+    if live_engine["direction"] == "UP" and live_engine["score"] >= 70:
+        score_b += 10; br.append("live early UP")
+    if live_engine["direction"] == "DOWN" and live_engine["score"] >= 70:
+        score_s += 10; sr_reasons.append("live early DOWN")
+
+    if score_b >= 70 and score_b > score_s:
+        return {"signal": "BUY", "score": min(100, score_b), "reason": ", ".join(br)}
+    if score_s >= 70 and score_s > score_b:
+        return {"signal": "SELL", "score": min(100, score_s), "reason": ", ".join(sr_reasons)}
+    return {
+        "signal": "WAIT",
+        "score": max(score_b, score_s),
+        "reason": "15M/5M setup not sufficiently confirmed.",
+    }
+
+
+def trade_levels(signal, price, m5):
+    x = enrich(m5)
+    if x.empty:
+        return None
+    a = float(x.atr.iloc[-1])
+    if signal == "BUY":
+        entry = price
+        sl = price - 1.15 * a
+        risk = entry - sl
+        return {
+            "entry": entry, "sl": sl,
+            "tp1": entry + 1.0 * risk,
+            "tp2": entry + 1.7 * risk,
+            "tp3": entry + 2.4 * risk,
+            "tp4": entry + 3.2 * risk,
+        }
+    if signal == "SELL":
+        entry = price
+        sl = price + 1.15 * a
+        risk = sl - entry
+        return {
+            "entry": entry, "sl": sl,
+            "tp1": entry - 1.0 * risk,
+            "tp2": entry - 1.7 * risk,
+            "tp3": entry - 2.4 * risk,
+            "tp4": entry - 3.2 * risk,
+        }
+    return None
+
+
+# -----------------------------
+# Backtest / Best Filter Engine
+# -----------------------------
+@st.cache_data(ttl=900, show_spinner=False)
+def get_backtest_5m(api_key: str, days: int = 30) -> pd.DataFrame:
+    if not api_key:
+        return pd.DataFrame()
+    end = datetime.now(timezone.utc)
+    start_all = end - timedelta(days=days)
+    frames = []
+    cursor_end = end
+    while cursor_end > start_all:
+        cursor_start = max(start_all, cursor_end - timedelta(days=6))
+        url = f"{BASE}/v1/hist/commodities/{SYMBOL}/bars"
+        params = {
+            "start": cursor_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "end": cursor_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "interval": "5m",
+            "limit": 2000,
+        }
+        try:
+            r = requests.get(url, params=params, headers={"X-API-Key": api_key, "Accept-Encoding": "gzip"}, timeout=20)
+            r.raise_for_status()
+            body = r.json()
+            rows = body.get("data", body if isinstance(body, list) else [])
+            if rows:
+                d = pd.DataFrame(rows).rename(columns={"t":"time","o":"open","h":"high","l":"low","c":"close","v":"volume"})
+                for c in ["open","high","low","close"]:
+                    d[c] = pd.to_numeric(d[c], errors="coerce")
+                # SiftingIO timestamps are epoch milliseconds.
+                d["time"] = pd.to_datetime(d["time"], unit="ms", utc=True)
+                frames.append(d.dropna(subset=["time","open","high","low","close"]))
+        except Exception:
+            break
+        cursor_end = cursor_start - timedelta(minutes=5)
+    if not frames:
+        return pd.DataFrame()
+    return (pd.concat(frames, ignore_index=True)
+            .sort_values("time").drop_duplicates("time").reset_index(drop=True))
+
+@st.cache_data(ttl=900, show_spinner=False)
+def prepare_backtest(df: pd.DataFrame):
+    """Prepare indicators once. The old version rebuilt these for every candidate,
+    which made the Backtest Lab look frozen on iPhone."""
+    x = enrich(df.copy()).reset_index(drop=True)
+    h15 = (x.set_index("time").resample("15min", label="left", closed="left")
+           .agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"})
+           .dropna().reset_index())
+    h1 = (x.set_index("time").resample("1h", label="left", closed="left")
+          .agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"})
+          .dropna().reset_index())
+    h15 = enrich(h15)
+    h1 = enrich(h1)
+    # Align higher-timeframe context once. The previous version did a
+    # DataFrame .loc[:t] search inside every trade/candidate, which could
+    # make the Backtest Lab appear frozen on mobile.
+    c15 = h15[["time","ema20","ema50","close"]].rename(columns={"ema20":"m15_ema20","ema50":"m15_ema50","close":"m15_close"})
+    c1 = h1[["time","ema20","ema50","close"]].rename(columns={"ema20":"h1_ema20","ema50":"h1_ema50","close":"h1_close"})
+    aligned = pd.merge_asof(x.sort_values("time"), c15.sort_values("time"), on="time", direction="backward")
+    aligned = pd.merge_asof(aligned.sort_values("time"), c1.sort_values("time"), on="time", direction="backward")
+    return aligned.reset_index(drop=True), h15.set_index("time"), h1.set_index("time")
+
+def _backtest_metrics(trades):
+    if not trades:
+        return {"trades":0,"win_rate":0.0,"pf":0.0,"avg_r":0.0,"net_r":0.0,"max_dd":0.0}
+    rs = np.array([t["r"] for t in trades], dtype=float)
+    wins = rs[rs > 0].sum()
+    losses = -rs[rs < 0].sum()
+    equity = np.cumsum(rs)
+    peak = np.maximum.accumulate(np.r_[0.0, equity])
+    dd = np.maximum(0.0, peak[1:] - equity)
+    return {
+        "trades": int(len(rs)),
+        "win_rate": float((rs > 0).mean() * 100),
+        "pf": float(wins / losses) if losses > 0 else (999.0 if wins > 0 else 0.0),
+        "avg_r": float(rs.mean()),
+        "net_r": float(rs.sum()),
+        "max_dd": float(dd.max()) if len(dd) else 0.0,
+    }
+
+def _run_prepared(prep, mode="COMPOSITE", adx_min=20, body_min=0.50, rr=1.7, start_i=250, end_i=None):
+    x, _, _ = prep
+    if x.empty or len(x) < 300:
+        return _backtest_metrics([])
+    end_i = min(len(x)-2, end_i if end_i is not None else len(x)-2)
+    start_i = max(250, int(start_i))
+
+    # Vectorized signal conditions: this is much faster than doing DataFrame
+    # slicing for every bar/candidate.
+    bull15 = (x.m15_ema20 > x.m15_ema50) & (x.m15_close > x.m15_ema20)
+    bear15 = (x.m15_ema20 < x.m15_ema50) & (x.m15_close < x.m15_ema20)
+    bull1 = x.h1_ema20 > x.h1_ema50
+    bear1 = x.h1_ema20 < x.h1_ema50
+    body = (x.close - x.open).abs() / (x.high - x.low).clip(lower=1e-9)
+    micro_hi = x.high.shift(1).rolling(5).max()
+    micro_lo = x.low.shift(1).rolling(5).min()
+
+    long = bull15 & bull1 & (x.close > x.ema20)
+    short = bear15 & bear1 & (x.close < x.ema20)
+    if mode in ("COMPOSITE", "EMA_RSI_ADX"):
+        long &= (x.rsi >= 52) & (x.adx >= adx_min) & (x.pdi > x.mdi)
+        short &= (x.rsi <= 48) & (x.adx >= adx_min) & (x.mdi > x.pdi)
+    elif mode == "PULLBACK":
+        long &= (x.adx >= adx_min) & (body >= body_min) & (x.low <= x.ema20) & (x.close > x.open) & (x.close > x.ema20)
+        short &= (x.adx >= adx_min) & (body >= body_min) & (x.high >= x.ema20) & (x.close < x.open) & (x.close < x.ema20)
+    elif mode == "BREAKOUT":
+        long &= (x.adx >= adx_min) & (body >= body_min) & (x.close > micro_hi)
+        short &= (x.adx >= adx_min) & (body >= body_min) & (x.close < micro_lo)
+    if mode == "COMPOSITE":
+        long &= (x.close > micro_hi) & (body >= body_min)
+        short &= (x.close < micro_lo) & (body >= body_min)
+
+    # Make an independent writable NumPy array before masking.
+    # Some pandas/NumPy combinations can return a read-only view here.
+    mask = np.asarray((long | short).to_numpy(dtype=bool), dtype=bool).copy()
+    mask[:start_i] = False
+    mask[end_i+1:] = False
+    entries = np.flatnonzero(mask)
+    if len(entries) == 0:
+        return _backtest_metrics([])
+
+    # Entry-by-entry execution is retained for conservative same-bar handling,
+    # but only actual candidate bars are scanned, not every historical bar.
+    trades=[]; next_allowed=start_i
+    highs=x.high.to_numpy(dtype=float); lows=x.low.to_numpy(dtype=float)
+    closes=x.close.to_numpy(dtype=float); atrs=x.atr.to_numpy(dtype=float)
+    long_arr=long.to_numpy();
+    for i in entries:
+        if i < next_allowed: continue
+        atrv=atrs[i]
+        if not np.isfinite(atrv) or atrv <= 0: continue
+        side=1 if long_arr[i] else -1
+        entry=float(closes[i]); risk=1.15*float(atrv)
+        sl=entry-side*risk; tp=entry+side*risk*rr
+        result=None; exit_i=i
+        stop=min(i+61, len(x))
+        for j in range(i+1, stop):
+            hi=float(highs[j]); lo=float(lows[j])
+            hit_sl = lo <= sl if side==1 else hi >= sl
+            hit_tp = hi >= tp if side==1 else lo <= tp
+            if hit_sl:
+                result=-1.0; exit_i=j; break
+            if hit_tp:
+                result=rr; exit_i=j; break
+        if result is not None:
+            trades.append({"r":result}); next_allowed=exit_i+4
+    return _backtest_metrics(trades)
+
+def _run_filter_backtest(df, mode="COMPOSITE", adx_min=20, body_min=0.50, rr=1.7):
+    return _run_prepared(prepare_backtest(df), mode, adx_min, body_min, rr)
+
+def run_best_filter_search(df):
+    prep = prepare_backtest(df)
+    modes = ["PULLBACK", "EMA_RSI_ADX", "BREAKOUT", "COMPOSITE"]
+    candidates = []
+    for mode in modes:
+        adxs = [18,22] if mode == "PULLBACK" else [18,20,22,25]
+        bodies = [0.50] if mode == "PULLBACK" else ([0.45,0.50,0.60] if mode == "COMPOSITE" else [0.50])
+        for adx_min in adxs:
+            for body_min in bodies:
+                for rr in [1.5,1.7,2.0]:
+                    m = _run_prepared(prep, mode, adx_min, body_min, rr)
+                    if m["trades"] >= 20:
+                        score = m["pf"] * max(m["avg_r"], 0) * 100 + m["win_rate"] * 0.15 - m["max_dd"] * 0.08
+                        candidates.append((score, mode, adx_min, body_min, rr, m))
+    candidates.sort(reverse=True, key=lambda z: z[0])
+    return candidates[:10]
+
+def run_oos_validation_safe_legacy(df, train_ratio=0.70):
+    if df.empty or len(df) < 1200:
+        return None
+    split = int(len(df) * train_ratio)
+    train = df.iloc[:split].reset_index(drop=True)
+    # Keep warm-up history before the unseen period, but only score after split.
+    prep_full = prepare_backtest(df)
+    candidates = run_best_filter_search(train)
+    if not candidates:
+        return None
+    best = candidates[0]
+    _, mode, adx_min, body_min, rr, train_metrics = best
+    test_metrics = _run_prepared(prep_full, mode, adx_min, body_min, rr, start_i=split)
+    return {
+        "split": split,
+        "train_bars": len(train),
+        "test_bars": len(df) - split,
+        "best": best,
+        "train": train_metrics,
+        "test": test_metrics,
+        "test_start": df.time.iloc[split],
+        "test_end": df.time.iloc[-1],
+    }
+
+
+# -----------------------------
+# Telegram
+# -----------------------------
+def telegram_send(text):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return False, "Telegram secrets not configured."
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID.strip(),
+        "text": text,
+        "disable_web_page_preview": True,
+    }
+    try:
+        r = requests.post(url, json=payload, timeout=15)
+        try:
+            data = r.json()
+        except Exception:
+            data = {}
+        if r.ok and data.get("ok") is True:
+            return True, "Telegram message sent successfully."
+        desc = data.get("description", r.text[:240])
+        return False, f"Telegram HTTP {r.status_code}: {desc}"
+    except requests.RequestException as e:
+        return False, f"Telegram network error: {e}"
+    except Exception as e:
+        return False, f"Telegram error: {e}"
+
+
+def telegram_diagnostics():
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return False, "Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID in Streamlit Secrets."
+    try:
+        me = requests.get(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getMe",
+            timeout=15,
+        )
+        try:
+            md = me.json()
+        except Exception:
+            md = {}
+        if not (me.ok and md.get("ok") is True):
+            return False, f"Bot token check failed: HTTP {me.status_code}: {md.get('description', me.text[:200])}"
+        bot_name = md.get("result", {}).get("username", "unknown")
+        return True, f"Bot connected: @{bot_name} • Chat ID configured: {TELEGRAM_CHAT_ID.strip()}"
+    except Exception as e:
+        return False, f"Telegram connection check failed: {e}"
+
+
+def maybe_alert(signal, engine, price, levels):
+    # Only high-quality signals. This is an alert, not an automatic order.
+    alert_state = get_alert_state()
+    if signal["signal"] not in ("BUY", "SELL"):
+        return
+    if signal["score"] < 70:
+        return
+    if engine["score"] < 70:
+        return
+
+    key = f'{signal["signal"]}|{round(price,2)}|{engine["status"]}|{signal["score"]}'
+    now = time.time()
+
+    # Avoid repeated alerts for the same state for 10 minutes.
+    if alert_state["last_key"] == key and now - alert_state["last_sent"] < 600:
+        return
+
+    if not levels:
+        return
+
+    emoji = "🟢" if signal["signal"] == "BUY" else "🔴"
+    text = (
+        f"{emoji} SMART FLOW GOLD — {signal['signal']} A+\n\n"
+        f"XAUUSD: {price:.2f}\n"
+        f"Signal score: {signal['score']}/100\n"
+        f"Early score: {engine['score']}/100\n"
+        f"Live engine: {engine['status']}\n"
+        f"1H: {engine['h1trend']} | 15M: {engine['m15trend']}\n\n"
+        f"ENTRY: {levels['entry']:.2f}\n"
+        f"SL: {levels['sl']:.2f}\n"
+        f"TP1: {levels['tp1']:.2f}\n"
+        f"TP2: {levels['tp2']:.2f}\n"
+        f"TP3: {levels['tp3']:.2f}\n"
+        f"TP4: {levels['tp4']:.2f}\n\n"
+        f"⚠️ Alert only — not an automatic order."
+    )
+    ok, result = telegram_send(text)
+    if ok:
+        alert_state["last_key"] = key
+        alert_state["last_sent"] = now
+        alert_state["last_result"] = "Telegram alert sent"
+    else:
+        alert_state["last_result"] = result
+
+
+# -----------------------------
+# UI
+# -----------------------------
+st.title("🟡 Smart Flow Gold — Live XAUUSD")
+st.caption("Live WebSocket • Smart Flow • Big Candle / Early Entry • Support/Resistance • Telegram A+ Alerts")
+
+with st.sidebar:
+    st.header("⚙️ Connection")
+    if SIFTING_KEY:
+        st.success("SiftingIO key: loaded from Secrets")
+    else:
+        SIFTING_KEY = st.text_input("SiftingIO API key", type="password")
+
+    st.markdown("**Telegram Secrets**")
+    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+        st.success("🔔 Telegram A/A+ alerts: ON")
+    else:
+        st.warning("Telegram alerts are OFF")
+        st.caption("Add TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in Streamlit Secrets.")
+
+    refresh = st.slider("Live refresh (seconds)", 5, 15, 5)
+    st.caption("Only the live dashboard refreshes; Backtest/Telegram sections stay stable.")
+    st.caption("A/A+ alert rule: Smart Flow ≥70 AND Early Engine ≥70.")
+    st.info("🟢 Support / 🔴 Resistance are rule-based pivot estimates, not a private TradingView indicator copy.")
+    st.caption("SiftingIO XAUUSD is an aggregated/reference price feed. Test before real-money use.")
+
+if not SIFTING_KEY:
+    st.error("Add SIFTINGIO_API_KEY in Streamlit Secrets first.")
+    st.stop()
+
+# Stable live refresh architecture:
+# The old version used a full-page st_autorefresh every few seconds. That
+# caused the entire app (including heavy sections) to rerun repeatedly.
+# Streamlit fragments now refresh only the live dashboard section, while
+# Backtest/Telegram controls remain stable.
+
+@st.fragment(run_every=refresh)
+def live_dashboard():
+    feed = get_feed(SIFTING_KEY)
+    snap = feed.snapshot()
+
+    # History (cached REST calls; these do not refetch on every live tick).
+    try:
+        h1 = get_bars(SIFTING_KEY, "1h", 260)
+        m15 = get_bars(SIFTING_KEY, "15m", 300)
+        rest5 = get_bars(SIFTING_KEY, "5m", 300)
+
+        if not rest5.empty:
+            rest5_age_min = (datetime.now(timezone.utc) - rest5.time.iloc[-1].to_pydatetime()).total_seconds() / 60
+        else:
+            rest5_age_min = float("inf")
+
+        if rest5.empty or rest5_age_min > 15:
+            one_min = get_bars(SIFTING_KEY, "1m", 2000)
+            if not one_min.empty:
+                one_min = one_min.set_index("time").sort_index()
+                rest5_fallback = one_min.resample("5min", label="left", closed="left").agg({
+                    "open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum",
+                }).dropna(subset=["open", "high", "low", "close"]).reset_index()
+                rest5 = rest5_fallback.tail(350).reset_index(drop=True)
+    except Exception as e:
+        st.error(f"SiftingIO history error: {e}")
+        h1 = m15 = rest5 = pd.DataFrame()
+
+    live5 = make_live_df(snap)
+    if not live5.empty and not rest5.empty:
+        base5 = pd.concat([rest5, live5], ignore_index=True).drop_duplicates("time", keep="last").sort_values("time").tail(350).reset_index(drop=True)
+    else:
+        base5 = live5 if not live5.empty else rest5
+
+    h1e = enrich(h1) if not h1.empty else h1
+    m15e = enrich(m15) if not m15.empty else m15
+    m5e = enrich(base5) if not base5.empty else base5
+
+    price = None
+    last_tick_age = None
+    price_source = "NONE"
+    quote = None
+
+    if snap["last_tick"]:
+        last_tick_age = max(0, time.time() - snap["last_tick"]["received"])
+        if last_tick_age <= 8:
+            price = float(snap["last_tick"]["price"])
+            price_source = "WEBSOCKET"
+
+    if price is None:
+        quote = get_live_quote(SIFTING_KEY)
+        if quote and quote.get("price") is not None:
+            price = float(quote["price"])
+            price_source = "REST_QUOTE_FALLBACK"
+
+    if price is None and not base5.empty:
+        price = float(base5.close.iloc[-1])
+        price_source = "HISTORICAL_FALLBACK"
+
+    if price is None:
+        st.warning("Waiting for live XAUUSD price…")
+        return
+
+    feed_live = price_source == "WEBSOCKET" and last_tick_age is not None and last_tick_age <= 8
+    engine = early_engine(base5, h1, m15, price)
+    if feed_live:
+        signal = smart_flow_signal(h1, m15, base5, engine)
+        levels = trade_levels(signal["signal"], price, base5)
+        maybe_alert(signal, engine, price, levels)
+    else:
+        signal = {"signal": "WAIT", "score": 0, "reason": "Live WebSocket is not fresh; waiting for live ticks."}
+        levels = None
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("XAUUSD LIVE", f"{price:,.2f}")
+    c2.metric("1H Bias", trend_state(h1e) if not h1e.empty else "—")
+    c3.metric("15M Setup", signal["signal"], f"score {signal['score']}")
+    c4.metric("5M Confirm", trend_state(m5e) if not m5e.empty else "—")
+    st.caption(f"Price source: **{price_source}** • Display price is a SiftingIO aggregated/reference XAUUSD price.")
+
+    if feed_live:
+        st.success(f"🟢 LIVE WebSocket • tick {last_tick_age:.1f}s ago")
+    elif price_source == "REST_QUOTE_FALLBACK":
+        st.warning("🟡 WebSocket reconnecting — price shown from live REST quote. Signals/alerts are paused until ticks resume.")
+    elif price_source == "HISTORICAL_FALLBACK":
+        st.error("🔴 Live feed unavailable — historical price only. Signals/alerts are paused.")
+    else:
+        st.warning(f"🟠 WebSocket reconnecting… {snap['error']}")
+
+    if signal["signal"] == "WAIT":
+        st.warning(f"🟡 WAIT — {signal['reason']} | Best score {signal['score']}/100")
+        st.info("Trade levels stay hidden while Smart Flow is WAIT.")
+    else:
+        st.success(f"{'🟢 BUY' if signal['signal']=='BUY' else '🔴 SELL'} — score {signal['score']}/100")
+        if levels:
+            cols = st.columns(6)
+            for col, key in zip(cols, ["entry","sl","tp1","tp2","tp3","tp4"]):
+                col.metric(key.upper(), f"{levels[key]:,.2f}")
+
+    st.subheader("Smart Flow Checklist")
+    cc1, cc2, cc3, cc4, cc5 = st.columns(5)
+    cc1.metric("1H trend", trend_state(h1e) if not h1e.empty else "—")
+    s5 = structure(m5e) if not m5e.empty else {}
+    cc2.metric("Sweep", "YES" if s5.get("sweep") else "NO")
+    cc3.metric("CHoCH", "YES" if s5.get("choch") else "NO")
+    cc4.metric("BOS", "UP" if s5.get("bos_bull") else "DOWN" if s5.get("bos_bear") else "NO")
+    cc5.metric("ADX", f"{m5e.adx.iloc[-1]:.1f}" if not m5e.empty else "—")
+
+    st.subheader("Key Support / Resistance")
+    sr5 = support_resistance(m5e) if not m5e.empty else {"support": [], "resistance": []}
+    sr15 = support_resistance(m15e) if not m15e.empty else {"support": [], "resistance": []}
+    sr1 = support_resistance(h1e) if not h1e.empty else {"support": [], "resistance": []}
+    a, b = st.columns(2)
+    with a:
+        st.markdown("🟢 **Support**")
+        st.write("1H:", ", ".join(f"{x:,.2f}" for x in sr1["support"]) or "—")
+        st.write("15M:", ", ".join(f"{x:,.2f}" for x in sr15["support"]) or "—")
+        st.write("5M:", ", ".join(f"{x:,.2f}" for x in sr5["support"]) or "—")
+    with b:
+        st.markdown("🔴 **Resistance**")
+        st.write("1H:", ", ".join(f"{x:,.2f}" for x in sr1["resistance"]) or "—")
+        st.write("15M:", ", ".join(f"{x:,.2f}" for x in sr15["resistance"]) or "—")
+        st.write("5M:", ", ".join(f"{x:,.2f}" for x in sr5["resistance"]) or "—")
+
+    st.subheader("⚡ Big Candle / Early Entry Engine")
+    ec1, ec2, ec3, ec4 = st.columns(4)
+    ec1.metric("Status", engine["status"]); ec2.metric("Direction", engine["direction"]); ec3.metric("Early Score", f"{engine['score']}/100"); ec4.metric("Quality", engine["quality"])
+    st.info(f"🔴/🟢 {engine['status']} • UP trigger {engine['up_trigger']:,.2f} • DOWN trigger {engine['down_trigger']:,.2f}")
+    e1, e2, e3 = st.columns(3)
+    e1.metric("Live candle range / ATR", f"{engine.get('atr_ratio', 0):.2f}x")
+    e2.metric("Body / range", f"{engine.get('body_ratio', 0):.0%}")
+    e3.metric("Tick speed", f"{engine.get('speed', 0):+.3f}/s")
+    if engine.get("reasons"):
+        st.caption("Why: " + " • ".join(engine["reasons"]))
+
+    with st.expander("📡 Data health / freshness"):
+        st.write(f"WebSocket connected: **{snap['connected']}**")
+        st.write(f"Last tick age: **{last_tick_age:.1f}s**" if last_tick_age is not None else "Last tick age: —")
+        st.write(f"Displayed price source: **{price_source}**")
+        for label, df in [("1H REST", h1), ("15M REST", m15), ("5M REST / 1M→5M fallback", rest5), ("Live 5M", live5)]:
+            if not df.empty:
+                ts = df.time.iloc[-1]
+                age = (datetime.now(timezone.utc) - ts.to_pydatetime()).total_seconds() / 60
+                st.write(f"{label}: {ts.strftime('%Y-%m-%d %H:%M UTC')} • {age:.1f} min old")
+            else:
+                st.write(f"{label}: unavailable")
+        if snap["error"]:
+            st.warning(snap["error"])
+
+# Fragment reruns only the live dashboard. No full-page refresh loop.
+live_dashboard()
+
+# Backtest Lab
+st.subheader("🧪 XAUUSD Backtest Lab — Best Filter")
+st.caption("No CSV upload: the app pulls historical XAUUSD 5M bars directly from SiftingIO and tests several filter combinations.")
+if st.button("🧪 Run 30-day backtest & find best filter"):
+    with st.spinner("Downloading XAUUSD history and testing filter combinations…"):
+        bt = get_backtest_5m(SIFTING_KEY, 30)
+        if bt.empty or len(bt) < 1000:
+            st.error("Not enough historical 5M data returned by SiftingIO for a reliable test.")
+        else:
+            results = run_best_filter_search(bt)
+            st.session_state["bt_results"] = results
+            st.session_state["bt_rows"] = len(bt)
+            st.session_state["bt_period"] = f"{bt.time.iloc[0]} → {bt.time.iloc[-1]}"
+if "bt_results" in st.session_state:
+    results = st.session_state["bt_results"]
+    st.caption(f"Tested {st.session_state.get('bt_rows',0):,} 5M bars • {st.session_state.get('bt_period','')}")
+    if results:
+        best = results[0]
+        _, mode, adx_min, body_min, rr, m = best
+        st.success(f"🏆 Best tested filter: {mode} • ADX ≥ {adx_min} • Body ≥ {body_min:.0%} • RR {rr:.1f}")
+        b1,b2,b3,b4,b5 = st.columns(5)
+        b1.metric("Trades", m["trades"])
+        b2.metric("Win rate", f"{m['win_rate']:.1f}%")
+        b3.metric("Profit factor", f"{m['pf']:.2f}")
+        b4.metric("Avg R", f"{m['avg_r']:.3f}")
+        b5.metric("Max DD (R)", f"{m['max_dd']:.1f}")
+        table = []
+        for rank, item in enumerate(results[:5], 1):
+            _, md, adxv, bodyv, rrv, mm = item
+            table.append({"Rank":rank,"Filter":md,"ADX":adxv,"Body":f"{bodyv:.0%}","RR":rrv,"Trades":mm["trades"],"Win %":round(mm["win_rate"],1),"PF":round(mm["pf"],2),"Avg R":round(mm["avg_r"],3),"Max DD R":round(mm["max_dd"],1)})
+        st.dataframe(pd.DataFrame(table), use_container_width=True, hide_index=True)
+        st.info("The winner is only the best result on this historical sample. It is NOT a guarantee. Keep the winning filter in paper/forward testing before real-money use.")
+
+        if st.button("🔬 Run 70/30 out-of-sample validation"):
+            with st.spinner("Validating the winning filter on unseen data…"):
+                try:
+                    # Self-contained OOS path: do not depend on a separately
+                    # named helper that can become stale on Streamlit Cloud.
+                    split = int(len(bt) * 0.70)
+                    if split < 1000 or len(bt) - split < 200:
+                        oos = None
+                    else:
+                        train = bt.iloc[:split].reset_index(drop=True)
+                        candidates_oos = run_best_filter_search(train)
+                        if not candidates_oos:
+                            oos = None
+                        else:
+                            best_oos = candidates_oos[0]
+                            _, mode_oos, adx_oos, body_oos, rr_oos, train_metrics_oos = best_oos
+                            prep_full_oos = prepare_backtest(bt)
+                            test_metrics_oos = _run_prepared(
+                                prep_full_oos, mode_oos, adx_oos, body_oos, rr_oos, start_i=split
+                            )
+                            oos = {
+                                "split": split,
+                                "train_bars": split,
+                                "test_bars": len(bt) - split,
+                                "best": best_oos,
+                                "train": train_metrics_oos,
+                                "test": test_metrics_oos,
+                                "test_start": bt.time.iloc[split],
+                                "test_end": bt.time.iloc[-1],
+                            }
+                    if oos is None:
+                        st.error("OOS validation could not be completed with the available history.")
+                    else:
+                        st.session_state["oos_result"] = oos
+                except Exception as e:
+                    st.error(f"OOS validation error: {type(e).__name__}: {e}")
+
+        if "oos_result" in st.session_state:
+            oos = st.session_state["oos_result"]
+            bm = oos["best"][5]
+            tm = oos["test"]
+            st.subheader("🔬 Out-of-sample validation")
+            st.caption(f"Training: {oos['train_bars']:,} bars • Unseen: {oos['test_bars']:,} bars • {oos['test_start']} → {oos['test_end']}")
+            q1,q2,q3,q4 = st.columns(4)
+            q1.metric("Training PF", f"{bm['pf']:.2f}")
+            q2.metric("Unseen PF", f"{tm['pf']:.2f}")
+            q3.metric("Unseen Win %", f"{tm['win_rate']:.1f}%")
+            q4.metric("Unseen Avg R", f"{tm['avg_r']:.3f}")
+            if tm["trades"] >= 20 and tm["pf"] > 1.0 and tm["avg_r"] > 0:
+                st.success("✅ Unseen period is positive. The filter can move to forward/paper testing — not straight to real money.")
+            else:
+                st.warning("⚠️ Unseen period is not strong enough. Do not promote this filter to live A+ alerts yet.")
+    else:
+        st.warning("No candidate produced enough trades under the current filters.")
+
+# Telegram status
+# Get a lightweight current price for the manual Telegram test without
+# depending on a variable inside the live fragment.
+test_price = None
+try:
+    _q = get_live_quote(SIFTING_KEY)
+    if _q and _q.get("price") is not None:
+        test_price = float(_q["price"])
+except Exception:
+    pass
+if test_price is None:
+    test_price = 0.0
+
+with st.expander("🔔 Telegram A/A+ alerts"):
+    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+        st.success("Telegram configuration loaded.")
+        st.caption("Alerts are sent only when Smart Flow ≥70 AND Early Engine ≥70. Duplicate states are throttled.")
+
+        if st.button("🔎 Check Telegram connection"):
+            ok, result = telegram_diagnostics()
+            st.session_state["telegram_diag"] = (ok, result)
+
+        if st.button("📩 Send Telegram test alert"):
+            ok, result = telegram_send(
+                f"🟡 Smart Flow Gold TEST\nXAUUSD: {test_price:.2f}\nTelegram connection is working."
+            )
+            st.session_state["telegram_test"] = (ok, result)
+
+        if "telegram_diag" in st.session_state:
+            ok, result = st.session_state["telegram_diag"]
+            (st.success if ok else st.error)(result)
+        if "telegram_test" in st.session_state:
+            ok, result = st.session_state["telegram_test"]
+            (st.success if ok else st.error)(result)
+    else:
+        st.warning("Add TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID to Streamlit Secrets.")
+
+st.divider()
+st.caption(
+    "Alert system only — not guaranteed prediction and not automatic order execution. "
+    "Backtest/forward-test before real-money use."
+)
