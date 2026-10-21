@@ -1,5 +1,0 @@
-streamlit==1.66.0
-numpy
-pandas
-requests
-websocket-client==1.9.2
