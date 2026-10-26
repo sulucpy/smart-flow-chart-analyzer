@@ -1,0 +1,14 @@
+# Regression checklist — London Kill Zone staging
+- [ ] `python -m py_compile app.py`
+- [ ] Existing Quick Trade / Full Pro / Strategy Lab / Time Machine modes still render.
+- [ ] Existing master signal and Order Block confirmation unchanged.
+- [ ] Missing/stale feed still blocks trade authorization.
+- [ ] Timezone checks around US and UK DST transitions.
+- [ ] Asian H/L only uses candles before current time (no future data).
+- [ ] Sweep only when wick breaches level and candle closes back inside.
+- [ ] FVG entry only after the FVG has formed; no same-candle entry fill.
+- [ ] Same-bar SL/TP ambiguity resolves conservatively to SL.
+- [ ] CSV invalid/missing timestamps and OHLC fail with a clear message.
+- [ ] Test with real XAUUSD history; costs/spread/slippage added before judging results.
+- [ ] Telegram alerts disabled by default; test chat only.
+- [ ] Do not deploy until mobile/desktop runtime and feed regression tests pass.
